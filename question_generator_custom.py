@@ -19,12 +19,14 @@ Features:
   • Optional storage: local JSON file and/or remote database via REST
   • Colored console logging for better readability
   • Automatic tag fetching from API if not provided via CLI
+  • Rate limiting to control API usage (default: 10 questions per minute)
 
 Usage:
-  python question_generator.py --api-key <YOUR_GEMINI_KEY> --num-questions 10 --question-types '["MCQ","TRUE_FALSE"]' --difficulty 2 --output questions.json [--tags '["class-12","calculus","integrals"]'] [--db-endpoint http://…/create-question]
+  python question_generator.py --api-key <YOUR_GEMINI_KEY> --num-questions 10 --question-types '["MCQ","TRUE_FALSE"]' --difficulty 2 --output questions.json [--tags '["class-12","calculus","integrals"]'] [--db-endpoint http://…/create-question] [--rate-limit 10]
 
   If --tags is omitted, the script will fetch tags from https://www.examshala.in/api/tags/single-tag.
   API_KEY and DB_API_ENDPOINT can also be set in a .env file or environment variables.
+  Rate limiting ensures responsible API usage by limiting questions to 10 per minute by default.
 """
 
 import argparse
@@ -35,6 +37,8 @@ import os
 import random
 import re
 import sys
+import time
+from collections import deque
 from typing import Dict, List, Optional, Union, Any, Tuple
 
 # External libraries
@@ -120,13 +124,13 @@ DEFAULT_QUESTION_TYPES = ["MCQ", "MOC", "SHORT_ANSWER"]
 # Default difficulty levels (1: Easy, 2: Medium, 3: Hard)
 DEFAULT_DIFFICULTIES = [1, 2, 3]
 DEFAULT_OUTPUT_FILE = "questions.json"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-preview-04-17"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 # Environment variables for sensitive configuration
 ENV_VAR_API_KEY = "GEMINI_API_KEY"
 # CHANGE: Updated DB endpoint to create-question
 ENV_VAR_DB_ENDPOINT = "https://app.examshala.in/api/create-multiple-questions-in-bank"
-TAGS_API_URL = "https://www.examshala.in/api/tags/by-subject?subjectId=62"  # API endpoint to fetch tags
+TAGS_API_URL = "https://www.examshala.in/api/tags/by-subject?subjectId=60"  # API endpoint to fetch tags
 
 # --- JSON Templates for Prompting ---
 # Using a dictionary to store prompt templates for each question type.
@@ -309,6 +313,74 @@ def parse_difficulty_arg(value: str) -> Union[int, List[int]]:
 
 
 # --- Core Logic Classes ---
+
+
+class RateLimiter:
+    """
+    A rate limiter that restricts operations to a specified number per time window.
+    Uses a sliding window approach with timestamps to track recent operations.
+    """
+
+    def __init__(self, max_operations: int, time_window_seconds: int):
+        """
+        Initialize the rate limiter.
+
+        Args:
+            max_operations: Maximum number of operations allowed in the time window.
+            time_window_seconds: Time window in seconds (e.g., 60 for per minute).
+        """
+        self.max_operations = max_operations
+        self.time_window_seconds = time_window_seconds
+        self.operation_timestamps = deque()  # Store timestamps of recent operations
+
+    def wait_if_needed(self) -> None:
+        """
+        Check if we need to wait before the next operation and sleep if necessary.
+        This method ensures we don't exceed the rate limit.
+        """
+        current_time = time.time()
+
+        # Remove timestamps outside the current time window
+        while (
+            self.operation_timestamps
+            and current_time - self.operation_timestamps[0] > self.time_window_seconds
+        ):
+            self.operation_timestamps.popleft()
+
+        # If we're at the limit, wait until we can proceed
+        if len(self.operation_timestamps) >= self.max_operations:
+            # Calculate how long to wait until the oldest operation expires
+            oldest_timestamp = self.operation_timestamps[0]
+            wait_time = self.time_window_seconds - (current_time - oldest_timestamp)
+
+            if wait_time > 0:
+                logger.info(
+                    f"Rate limit reached. Waiting {wait_time:.2f} seconds before next question generation..."
+                )
+                time.sleep(wait_time)
+                # Remove the expired timestamp after waiting
+                self.operation_timestamps.popleft()
+
+        # Record this operation
+        self.operation_timestamps.append(time.time())
+
+    def get_remaining_capacity(self) -> int:
+        """
+        Get the number of operations that can be performed immediately without waiting.
+
+        Returns:
+            Number of operations that can be performed without hitting the rate limit.
+        """
+        current_time = time.time()
+
+        # Remove timestamps outside the current time window
+        while (
+            self.operation_timestamps
+            and current_time - self.operation_timestamps[0] > self.time_window_seconds
+        ):
+            self.operation_timestamps.popleft()
+
+        return max(0, self.max_operations - len(self.operation_timestamps))
 
 
 class QuestionGenerator:
@@ -578,6 +650,7 @@ class QuestionGenerator:
                 not response
                 or not response.candidates
                 or not response.candidates[0].content
+                or not response.candidates[0].content.parts
             ):
                 logger.warning(
                     f"Gemini response blocked or empty for '{topic}' ({question_type}, difficulty {difficulty})."
@@ -595,12 +668,18 @@ class QuestionGenerator:
                 return None
 
             # Extract and parse the JSON from the response text
-            question_data = self._extract_json_from_response(response.text)
+            try:
+                response_text = response.text
+            except ValueError as e:
+                logger.error(f"Failed to access response text: {e}")
+                return None
+
+            question_data = self._extract_json_from_response(response_text)
 
             # Validate if JSON extraction/parsing was successful
             if not question_data:
                 logger.error(
-                    f"Failed to extract valid JSON from response for '{topic}' ({question_type}, difficulty {difficulty}). Raw text received:\n{response.text}..."
+                    f"Failed to extract valid JSON from response for '{topic}' ({question_type}, difficulty {difficulty}). Raw text received (truncated)"
                 )
                 return None
 
@@ -663,23 +742,21 @@ class QuestionGenerator:
                 f"An unexpected error occurred during question generation for '{topic}' ({question_type}, difficulty {difficulty}): {e}",
                 exc_info=True,  # Log the full traceback
             )
-            # Optionally log the raw response text if available before the error occurred
-            if "response" in locals() and hasattr(response, "text"):  # type: ignore
-                logger.debug(f"Raw response text before error: {response.text[:1000]}{'...' if len(response.text) > 1000 else ''}")  # type: ignore
             return None
 
 
 class QuestionManager:
     """
     Orchestrates the question generation process.
-    Handles batch generation, derives module IDs, and manages storage options
-    (saving to file and pushing to a database API).
+    Handles batch generation, derives module IDs, manages storage options
+    (saving to file and pushing to a database API), and enforces rate limiting.
     """
 
     def __init__(
         self,
         api_key: str,
         db_endpoint: Optional[str] = None,  # Database endpoint is optional
+        max_questions_per_minute: int = 10,  # Rate limit: 10 questions per minute
     ):
         """
         Initialize the Question Manager.
@@ -687,14 +764,25 @@ class QuestionManager:
         Args:
             api_key: Google Gemini API key.
             db_endpoint: Optional URL endpoint for database storage API.
+            max_questions_per_minute: Maximum number of questions to generate per minute.
         """
         # Initialize the question generator instance
         self.generator = QuestionGenerator(api_key)
         self.db_endpoint = db_endpoint
+
+        # Initialize rate limiter (10 questions per 60 seconds by default)
+        self.rate_limiter = RateLimiter(
+            max_operations=max_questions_per_minute, time_window_seconds=60
+        )
+
         if self.db_endpoint:
             logger.info(f"Database endpoint configured: {self.db_endpoint}")
         else:
             logger.info("No database endpoint configured. DB push will be skipped.")
+
+        logger.info(
+            f"Rate limiter configured: {max_questions_per_minute} questions per minute"
+        )
 
     def _derive_module_id(self, tags: List[str]) -> str:
         """
@@ -820,6 +908,9 @@ class QuestionManager:
 
         # Iterate through the planned tasks and attempt to generate each question
         for i, (q_type, diff) in enumerate(generation_tasks):
+            # Apply rate limiting before each question generation
+            self.rate_limiter.wait_if_needed()
+
             # Select a specific topic from the tags for the prompt's 'Specific Topic/Focus' field
             # Prioritize non-class tags if available
             available_topics = [t for t in tags if "class-" not in t.lower()]
@@ -830,8 +921,11 @@ class QuestionManager:
                 else (tags[0] if tags else "general")
             )
 
+            # Show rate limit status
+            remaining_capacity = self.rate_limiter.get_remaining_capacity()
             logger.info(
-                f"Attempting question {i+1}/{num_questions} (Type: {q_type}, Difficulty: {diff}, Topic: '{topic}')..."
+                f"Attempting question {i+1}/{num_questions} (Type: {q_type}, Difficulty: {diff}, Topic: '{topic}') "
+                f"- Rate limit: {remaining_capacity} remaining in current minute..."
             )
 
             # Call the QuestionGenerator to get a single question
@@ -858,9 +952,8 @@ class QuestionManager:
                     f"Failed to generate question {i+1}/{num_questions} (Type: {q_type}, Difficulty: {diff}). Skipping."
                 )
 
-            # Optional: Add a small delay between API calls to respect rate limits or cool down
-            # import time
-            # time.sleep(0.5) # Example: wait for 0.5 seconds
+            # Note: Rate limiting is now handled automatically by the RateLimiter class
+            # before each question generation attempt above
 
         logger.info(
             f"Finished all generation attempts. Successfully generated {generated_count} out of {num_questions} requested questions."
@@ -1112,6 +1205,14 @@ def parse_arguments():
         help="Output JSON file path to save generated questions.",
     )
 
+    # Argument for rate limiting
+    parser.add_argument(
+        "--rate-limit",
+        type=int,
+        default=10,
+        help="Maximum number of questions to generate per minute (default: 10).",
+    )
+
     # Parse the arguments
     args = parser.parse_args()
 
@@ -1150,6 +1251,11 @@ def parse_arguments():
         logger.error(
             "--difficulty must be an integer between 1 and 3, or a list of such integers."
         )
+        sys.exit(1)
+
+    # Validate rate limit argument
+    if not isinstance(args.rate_limit, int) or args.rate_limit <= 0:
+        logger.error("--rate-limit must be a positive integer.")
         sys.exit(1)
 
     # Note: Validation for 'tags' is moved to main() after checking if API fetch is needed
@@ -1255,10 +1361,14 @@ def main():
             logger.critical("Default tags are also invalid! Exiting.")
         sys.exit(1)  # Exit if the final tag list is invalid
 
-    # Initialize the QuestionManager with API key and optional DB endpoint
+    # Initialize the QuestionManager with API key, optional DB endpoint, and rate limit
     # The manager initializes the QuestionGenerator, which handles API config and exit on failure.
     try:
-        manager = QuestionManager(api_key=args.api_key, db_endpoint=args.db_endpoint)
+        manager = QuestionManager(
+            api_key=args.api_key,
+            db_endpoint=args.db_endpoint,
+            max_questions_per_minute=args.rate_limit,
+        )
     except SystemExit:
         # QuestionGenerator already logged the error and exited via sys.exit
         # Re-raise SystemExit to ensure the program terminates
